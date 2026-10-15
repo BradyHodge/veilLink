@@ -3,13 +3,21 @@
 
 start() ->
     case read_csv("config.csv") of
+        {ok, []} ->
+            fail("No valid rules in config.csv~n", []);
         {ok, Config} -> 
             lists:foreach(fun({Protocol, ListenPort, ForwardIP, ForwardPort}) ->
                 spawn(fun() -> listen(Protocol, ListenPort, ForwardIP, ForwardPort) end)
             end, Config);
         {error, Reason} ->
-            io:format("Error reading config file: ~p~n", [Reason])
+            fail("Error reading config file: ~p~n", [Reason])
     end.
+
+%% Exit with a non-zero status so a service manager (e.g. systemd) sees the
+%% failure, instead of leaving a VM running that forwards nothing.
+fail(Format, Args) ->
+    io:format(Format, Args),
+    erlang:halt(1).
 
 read_csv(FileName) ->
     case file:read_file(FileName) of
@@ -58,12 +66,16 @@ parse_protocol(_) -> unknown.
 
 listen(tcp, ListenPort, ForwardIP, ForwardPort) ->
     io:format("Starting TCP listener on port ~p -> ~s:~p~n", [ListenPort, ForwardIP, ForwardPort]),
-    case gen_tcp:listen(ListenPort, [binary, {active, false}, {packet, raw}, {reuseaddr, true}]) of
+    %% Invalid options, such as an out-of-range port, raise instead of returning an error.
+    Result = try gen_tcp:listen(ListenPort, [binary, {active, false}, {packet, raw}, {reuseaddr, true}])
+             catch _:Reason -> {error, Reason}
+             end,
+    case Result of
         {ok, ListenSocket} ->
             io:format("Successfully listening (TCP) on port ~p~n", [ListenPort]),
             accept(ListenSocket, ForwardIP, ForwardPort);
         Error ->
-            io:format("TCP Listen error: ~p~n", [Error])
+            fail("TCP Listen error on port ~p: ~p~n", [ListenPort, Error])
     end;
 
 %% =============================================================================
@@ -72,7 +84,11 @@ listen(tcp, ListenPort, ForwardIP, ForwardPort) ->
 
 listen(udp, ListenPort, ForwardIP, ForwardPort) ->
     io:format("Starting UDP listener on port ~p -> ~s:~p~n", [ListenPort, ForwardIP, ForwardPort]),
-    case gen_udp:open(ListenPort, [binary, {active, true}, {reuseaddr, true}]) of
+    %% Invalid options, such as an out-of-range port, raise instead of returning an error.
+    Result = try gen_udp:open(ListenPort, [binary, {active, true}, {reuseaddr, true}])
+             catch _:Reason -> {error, Reason}
+             end,
+    case Result of
         {ok, Socket} ->
             io:format("Successfully listening (UDP) on port ~p~n", [ListenPort]),
             %% Create ETS table to track client mappings
@@ -80,7 +96,7 @@ listen(udp, ListenPort, ForwardIP, ForwardPort) ->
             ets:new(TableName, [named_table, public, set]),
             udp_loop(Socket, ForwardIP, ForwardPort, TableName);
         Error ->
-            io:format("UDP Listen error: ~p~n", [Error])
+            fail("UDP Listen error on port ~p: ~p~n", [ListenPort, Error])
     end.
 
 udp_loop(ListenSocket, ForwardIP, ForwardPort, ClientTable) ->
@@ -149,30 +165,38 @@ udp_forward_loop(ListenSocket, ClientIP, ClientPort, ForwardSocket, ForwardIP, F
     end.
 
 %% =============================================================================
-%% TCP Functions (unchanged from original)
+%% TCP Functions
 %% =============================================================================
 
 accept(ListenSocket, ForwardIP, ForwardPort) ->
-    {ok, ClientSocket} = gen_tcp:accept(ListenSocket),
-    spawn(fun() -> forward(ClientSocket, ForwardIP, ForwardPort) end),
+    case gen_tcp:accept(ListenSocket) of
+        {ok, ClientSocket} ->
+            %% Transfer ownership before the handler touches the socket, so the
+            %% socket is closed whenever the handler exits.
+            Pid = spawn(fun() -> receive go -> forward(ClientSocket, ForwardIP, ForwardPort) end end),
+            gen_tcp:controlling_process(ClientSocket, Pid),
+            Pid ! go;
+        {error, Reason} ->
+            %% Usually transient (e.g. out of file descriptors); back off
+            %% instead of spinning.
+            io:format("TCP Accept error: ~p~n", [Reason]),
+            timer:sleep(100)
+    end,
     accept(ListenSocket, ForwardIP, ForwardPort).
 
 forward(ClientSocket, ForwardIP, ForwardPort) ->
     case gen_tcp:connect(ForwardIP, ForwardPort, [binary, {active, false}, {packet, raw}]) of
         {ok, ForwardSocket} ->
-            Pid1 = spawn(fun() -> forward_loop(ClientSocket, ForwardSocket, "client->server") end),
-            Pid2 = spawn(fun() -> forward_loop(ForwardSocket, ClientSocket, "server->client") end),
-            receive
-                {'EXIT', Pid1, _} -> ok;
-                {'EXIT', Pid2, _} -> ok
-            end;
+            %% One direction runs here, the other in a linked process. This
+            %% process owns both sockets, so nothing outlives the connection.
+            spawn_link(fun() -> forward_loop(ForwardSocket, ClientSocket, "server->client") end),
+            forward_loop(ClientSocket, ForwardSocket, "client->server");
         Error ->
             io:format("TCP Connection error: ~p~n", [Error]),
             gen_tcp:close(ClientSocket)
     end.
 
 forward_loop(SourceSocket, DestinationSocket, Direction) ->
-    process_flag(trap_exit, true),
     case gen_tcp:recv(SourceSocket, 0) of
         {ok, Data} ->
             case gen_tcp:send(DestinationSocket, Data) of

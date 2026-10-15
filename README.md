@@ -77,6 +77,23 @@ Press `Ctrl+C` twice or use:
 init:stop().
 ```
 
+## Running as a Service
+On Linux systems that use systemd, `install.sh` compiles the module and installs it as a `veillink` service that starts at boot:
+```bash
+sudo ./install.sh
+```
+
+The service runs as an unprivileged `veillink` user (it can still listen on ports below 1024) and reads its rules from `/etc/veillink/config.csv`. The repository's `config.csv` is copied there on the first install; re-running the script upgrades the program without overwriting that file. After editing the configuration, restart the service:
+```bash
+sudo systemctl restart veillink
+journalctl -u veillink -f
+```
+
+To remove the service (the configuration in `/etc/veillink` is kept):
+```bash
+sudo ./install.sh --uninstall
+```
+
 ## How It Works
 
 ### TCP Forwarding
@@ -114,9 +131,9 @@ VeilLink is built on Erlang's lightweight process model:
 
 ## Error Handling
 - Invalid configuration entries are skipped
+- The proxy exits with status 1 if `config.csv` can't be read, contains no valid rules, or a listener can't open its port, so a service manager such as systemd reports the failure
 - Connection failures are logged to stdout
 - Socket errors trigger automatic cleanup
-- Failed listeners are reported but don't stop other ports
 - UDP client mappings are cleaned up on handler exit
 
 ## Limitations
